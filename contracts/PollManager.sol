@@ -1,8 +1,14 @@
-pragma solidity ^0.4.11;
-
 import "./Owned.sol";
 import "./LowLevelStringManipulator.sol";
 import "./MiniMeToken.sol";
+
+pragma solidity ^0.4.13;
+
+contract DelegativeDemocracy {
+    function delegationOfAt(address _who, uint _block) constant returns(address);
+    function influenceOfAt(address _who, MiniMeToken _token, uint _block) constant returns(uint256);
+    function delegate(address _to);
+}
 
 contract IPollContract {
     function deltaVote(int _amount, bytes32 _ballot) returns (bool _succes);
@@ -25,6 +31,7 @@ contract PollManager is LowLevelStringManipulator, Owned {
         uint startBlock;
         uint endBlock;
         address token;
+        address delegation;
         address pollContract;
         bool canceled;
         mapping(address => VoteLog) votes;
@@ -39,93 +46,82 @@ contract PollManager is LowLevelStringManipulator, Owned {
     }
 
     function addPoll(
+        address _delegation,
         address _token,
         uint _startBlock,
         uint _endBlock,
         address _pollFactory,
         bytes _description) onlyOwner returns (uint _idPoll)
     {
-        if (_endBlock <= _startBlock) throw;
-        if (_endBlock <= getBlockNumber()) throw;
+        require (_endBlock > _startBlock);
+        require (_endBlock > getBlockNumber());
         _idPoll = _polls.length;
         _polls.length ++;
-        Poll p = _polls[ _idPoll ];
+        Poll storage p = _polls[ _idPoll ];
         p.startBlock = _startBlock;
         p.endBlock = _endBlock;
-
+        p.delegation = _delegation;
 
         var (name,symbol) = getTokenNameSymbol(_token);
         string memory proposalName = strConcat(name , "_", uint2str(_idPoll));
         string memory proposalSymbol = strConcat(symbol, "_", uint2str(_idPoll));
 
-        p.token = tokenFactory.createCloneToken(
-            _token,
-            _startBlock - 1,
-            proposalName,
-            MiniMeToken(_token).decimals(),
-            proposalSymbol,
-            true);
-
 
         p.pollContract = IPollFactory(_pollFactory).create(_description);
 
-        if (p.pollContract == 0) throw;
+        assert (p.pollContract != 0);
     }
 
     function cancelPoll(uint _idPoll) onlyOwner {
-        if (_idPoll >= _polls.length) throw;
-        Poll p = _polls[_idPoll];
-        if (getBlockNumber() >= p.endBlock) throw;
+        require (_idPoll < _polls.length);
+        Poll storage p = _polls[_idPoll];
+        require (getBlockNumber() < p.endBlock);
         p.canceled = true;
         PollCanceled(_idPoll);
     }
 
     function vote(uint _idPoll, bytes32 _ballot) {
-        if (_idPoll >= _polls.length) throw;
-        Poll p = _polls[_idPoll];
-        if (getBlockNumber() < p.startBlock) throw;
-        if (getBlockNumber() >= p.endBlock) throw;
-        if (p.canceled) throw;
+        require (_idPoll < _polls.length);
+        Poll storage p = _polls[_idPoll];
+        require (getBlockNumber() >= p.startBlock);
+        require (getBlockNumber() < p.endBlock);
+        require (!p.canceled);
 
         unvote(_idPoll);
+        
+        uint amount;
+        if (p.delegation != 0x0){
+            amount = DelegativeDemocracy(p.delegation).influenceOfAt(msg.sender, MiniMeToken(p.token), p.startBlock);
+        } else {
+            amount = MiniMeToken(p.token).balanceOfAt(msg.sender, p.startBlock);
+        }
 
-        uint amount = MiniMeToken(p.token).balanceOf(msg.sender);
-
-        if (amount == 0) throw;
-
-
-//        enableTransfers = true;
-        if (!MiniMeToken(p.token).transferFrom(msg.sender, address(this), amount)) throw;
-//        enableTransfers = false;
+        require (amount > 0);
 
         p.votes[msg.sender].ballot = _ballot;
         p.votes[msg.sender].amount = amount;
 
-        if (!IPollContract(p.pollContract).deltaVote(int(amount), _ballot)) throw;
+        assert (IPollContract(p.pollContract).deltaVote(int(amount), _ballot));
 
         Vote(_idPoll, msg.sender, _ballot, amount);
     }
 
     function unvote(uint _idPoll) {
-        if (_idPoll >= _polls.length) throw;
-        Poll p = _polls[_idPoll];
-        if (getBlockNumber() < p.startBlock) throw;
-        if (getBlockNumber() >= p.endBlock) throw;
-        if (p.canceled) throw;
+        require (_idPoll < _polls.length);
+        Poll storage p = _polls[_idPoll];
+        require (getBlockNumber() >= p.startBlock);
+        require (getBlockNumber() < p.endBlock);
+        require (!p.canceled);
 
         uint amount = p.votes[msg.sender].amount;
         bytes32 ballot = p.votes[msg.sender].ballot;
-        if (amount == 0) return;
+        require (amount > 0);
 
-        if (!IPollContract(p.pollContract).deltaVote(-int(amount), ballot)) throw;
+        assert (IPollContract(p.pollContract).deltaVote(-int(amount), ballot));
 
 
-        p.votes[msg.sender].ballot = 0;
+        p.votes[msg.sender].ballot = 0x0;
         p.votes[msg.sender].amount = 0;
-
-//        enableTransfers = true;
-        if (!MiniMeToken(p.token).transferFrom(address(this), msg.sender, amount)) throw;
-//        enableTransfers = false;
 
         Unvote(_idPoll, msg.sender, ballot, amount);
     }
@@ -140,6 +136,7 @@ contract PollManager is LowLevelStringManipulator, Owned {
         uint _startBlock,
         uint _endBlock,
         address _token,
+        address _delegation,
         address _pollContract,
         bool _canceled,
         bytes32 _pollType,
@@ -147,22 +144,23 @@ contract PollManager is LowLevelStringManipulator, Owned {
         bool _finalized,
         uint _totalCensus
     ) {
-        if (_idPoll >= _polls.length) throw;
-        Poll p = _polls[_idPoll];
+        require (_idPoll < _polls.length);
+        Poll storage p = _polls[_idPoll];
         _startBlock = p.startBlock;
         _endBlock = p.endBlock;
         _token = p.token;
+        _delegation = p.delegation;
         _pollContract = p.pollContract;
         _canceled = p.canceled;
         _pollType = IPollContract(p.pollContract).pollType();
         _question = getString(p.pollContract, bytes4(sha3("question()")));
         _finalized = (!p.canceled) && (getBlockNumber() >= _endBlock);
-        _totalCensus = MiniMeToken(p.token).totalSupply();
+        _totalCensus = MiniMeToken(p.token).totalSupplyAt(p.startBlock);
     }
 
     function getVote(uint _idPoll, address _voter) constant returns (bytes32 _ballot, uint _amount) {
-        if (_idPoll >= _polls.length) throw;
-        Poll p = _polls[_idPoll];
+        require (_idPoll < _polls.length);
+        Poll storage p = _polls[_idPoll];
 
         _ballot = p.votes[_voter].ballot;
         _amount = p.votes[_voter].amount;
